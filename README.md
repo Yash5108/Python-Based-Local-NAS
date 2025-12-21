@@ -82,5 +82,3 @@ The web interface features a modern table view with:
 **Open-source and free for personal use.**  
 Feel free to modify it for your specific needs!
 ```
-
-Would you like me to add a **"How It Works"** or **"Future Enhancements"** section for better structure in your GitHub README?
