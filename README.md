@@ -1,84 +1,64 @@
-# 📂 Python Simple NAS Server
+# Python NAS Server
 
-A lightweight, multi-threaded **Network Attached Storage (NAS)** solution written in a single Python script.  
-Transform any directory into a web-based file management hub accessible from any device on your **local network**.
+A tiny file-server / simple NAS written with Python's built-in http.server. It supports drag-and-drop uploads, downloads with progress, delete requests (admin-confirmed), and automatic browser live-reload when files change.
 
----
+## Features
 
-## ✨ Key Features
+- Browse files and folders in the serving directory
+- Drag & drop or click-to-browse file uploads (multipart/form-data)
+- Download files with progress
+- Delete requests that require server admin confirmation
+- Live-reload in connected browsers via Server-Sent Events (SSE)
 
-- 🌐 **Web Interface:** Clean, responsive UI for managing files from any browser (mobile & desktop).  
-- 📤 **High-Speed Uploads:** Supports multiple file uploads with a real-time progress bar, speed tracker (KB/s), and time estimates.  
-- 📥 **Reliable Downloads:** Integrated download progress tracking for large files.  
-- 🛡️ **Admin-Verified Deletion:**  
-  Users can request deletion — the server admin must manually type `yes` in the terminal to confirm.  
-  Prevents accidental or malicious data loss.  
-- 🔒 **Built-in Protection:**  
-  The server script itself is hidden from the web UI.  
-  Protected files cannot be downloaded, overwritten, or deleted.  
-- 🚀 **Zero Dependencies:** Works out of the box with standard Python 3.7+ libraries (handles CGI deprecation in newer Python versions).  
-- 🧵 **Multi-threaded:** Handles multiple users uploading/downloading simultaneously.  
+## Requirements
 
----
+- Python 3.8+
+- No external packages required
 
-## 🚀 Quick Start
+## Quick Start
 
-### 1. Requirements
-- **Python 3.7 or higher**
-- **No external libraries** (no `pip install` required)
+Open PowerShell, change to the project directory and run:
 
-### 2. Launch the Server
-Place the script in the folder you wish to share and run:
-
-```
+```powershell
+cd "d:\YASH\local nas"
 python simple_nas.py
 ```
 
-### 3. Accessing the NAS
-Once started, the terminal will display your local addresses:
+By default the server listens on port 8000. You can open the UI at:
 
-```
-Local:   http://localhost:8000
-Network: http://192.168.x.x:8000
-```
+- http://localhost:8000
 
-Use the **Network (LAN)** address to access from your phone or other PCs.
+The server prints the LAN address (if available) when it starts.
 
----
+## Configuration
 
-## 🛠️ Configuration
+You can change these variables at the top of `simple_nas.py`:
 
-You can edit these variables at the top of the `simple_nas.py` file:
+- `PORT` — TCP port the server listens on (default: `8000`)
+- `DIRECTORY` — root directory served (default: current working directory)
+- `MAX_UPLOAD_SIZE` — optional maximum upload size in bytes (default: `None` = unlimited)
+- `PROTECTED_FILES` — set of filenames that cannot be overwritten, downloaded, or deleted
 
-| Variable | Description |
-|-----------|-------------|
-| **PORT** | The port the server listens on. *(Default: 8000)* |
-| **DIRECTORY** | The root folder to share. *(Default: current directory)* |
-| **MAX_UPLOAD_SIZE** | Set a limit in bytes to prevent disk filling. *(Default: None)* |
-| **PROTECTED_FILES** | List of files to hide and lock from the web interface. |
+## Live-reload behavior
 
----
+The server exposes an SSE endpoint at `/events`. Browsers connect automatically and will reload when the server detects changes in the serving directory. The server uses a lightweight polling watcher (checks every 1s) that notifies connected clients.
 
-## ⚠️ Important Notes
+If you prefer a different strategy (inotify, Watchdog, or polling interval change), edit the watcher implementation in `simple_nas.py`.
 
-- 🔒 **Security:** Intended for **Local Area Network (LAN)** use only.  
-  Do **not** expose the port to the public internet (port forwarding) without a password-protected reverse proxy (e.g., Nginx).  
-- 🧑‍💻 **Admin Interaction:** The deletion process requires the admin to be present at the server terminal to approve delete requests.  
-- 🧩 **Compatibility:** Includes a custom fallback parser for `multipart/form-data`, ensuring compatibility with Python 3.13 and beyond (where the `cgi` module is removed).  
+## Security notes
 
----
+- This project is intended for local/trusted networks and simple personal use. It does not implement authentication.
+- Keep `PROTECTED_FILES` populated with any sensitive filenames (for example `simple_nas.py`).
+- Consider running behind a reverse proxy with TLS for exposure to untrusted networks.
 
-## 🖥️ UI Screenshots
+## Troubleshooting
 
-The web interface features a modern table view with:
-- 📁 Folder navigation  
-- 📊 Human-readable file sizes (KB, MB, GB)  
-- 🟢 Real-time progress indicators for all network activity  
+- If browsers don't auto-reload, ensure your browser allows SSE and that no proxy blocks `text/event-stream` responses.
+- If uploads fail, check `MAX_UPLOAD_SIZE` and file permissions in the serving directory.
+
+## Files
+
+- `simple_nas.py` — main server script
 
 ---
-
-## 📜 License
-
-**Open-source and free for personal use.**  
-Feel free to modify it for your specific needs!
-```
+Created for quick local file sharing with live-reload.
