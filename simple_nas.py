@@ -1,6 +1,5 @@
 import http.server
 import socketserver
-# import cgi   <-- removed, use fallback parser if cgi missing
 import os
 import posixpath
 import urllib.parse
@@ -963,4 +962,5 @@ if __name__ == '__main__':
         print("\nServer stopped.")
     except Exception as e:
         print(f"An error occurred: {e}")
+
 
