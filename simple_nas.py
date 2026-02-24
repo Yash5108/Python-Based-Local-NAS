@@ -1,5 +1,7 @@
 import http.server
 import socketserver
+import ssl
+# import cgi   <-- removed, use fallback parser if cgi missing
 import os
 import posixpath
 import urllib.parse
@@ -9,6 +11,32 @@ import tempfile
 import time
 import json
 import uuid
+import threading
+import hashlib
+import hmac
+import secrets
+import sys
+from datetime import datetime
+from collections import defaultdict
+
+# Fix Windows console encoding for emoji support
+if sys.platform == 'win32':
+    try:
+        sys.stdout.reconfigure(encoding='utf-8')
+        sys.stderr.reconfigure(encoding='utf-8')
+    except Exception:
+        pass
+
+# Safe print function for Windows console
+def safe_print(text):
+    """Print text, handling Unicode encoding errors on Windows."""
+    try:
+        print(text)
+    except UnicodeEncodeError:
+        # Remove emoji and special characters if encoding fails
+        import re
+        clean_text = re.sub(r'[^\x00-\x7F]+', '', text)
+        print(clean_text)
 
 # try to import cgi but continue if unavailable
 try:
@@ -18,14 +46,57 @@ except Exception:
     cgi = None
     _HAS_CGI = False
 
-PORT = 8000
-DIRECTORY = os.getcwd() # Use the current working directory as the NAS root
-MAX_UPLOAD_SIZE = None  # No limit (or set to size in bytes)
+PORT = 8443  # HTTPS port (use 443 for production)
+# Base directory (project root)
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+# NAS Container - all shared files stored here (keeps parent directory protected)
+DIRECTORY = os.path.join(BASE_DIR, "nas container")
+MAX_UPLOAD_SIZE = 5120 * 1024 * 1024  # 5 GB limit (adjust as needed)
+
+# SECURITY CONFIGURATION
+USE_HTTPS = True  # Enable HTTPS (recommended)
+CERT_FILE = os.path.join(BASE_DIR, "nas_cert.pem")  # SSL certificate file
+KEY_FILE = os.path.join(BASE_DIR, "nas_key.pem")    # SSL private key file
+# Certificate identity (Common Name and SANs)
+CERT_COMMON_NAME = "Yash Jain"
+CERT_SANS = [
+    "DNS:localhost",
+    "IP:127.0.0.1",
+    "DNS:yash5108"
+]
+
+# Optional password protection (leave empty to disable)
+# IMPORTANT: Use a strong password and never commit this to version control!
+NAS_PASSWORD = "#nas@yash*5108"  # Set to a password to enable authentication
+# Store hashed password (SHA-256) instead of plaintext
+NAS_PASSWORD_HASH = hashlib.sha256(NAS_PASSWORD.encode()).hexdigest() if NAS_PASSWORD else ""
+
+# Session management
+SESSION_TOKENS = {}  # Cache of valid session tokens {token: (timestamp, expiry)}
+SESSION_TIMEOUT = 3600  # 1 hour session timeout
+CSRF_TOKENS = {}  # CSRF token storage {session_token: csrf_token}
+
+# Rate limiting for login attempts
+LOGIN_ATTEMPTS = defaultdict(list)  # {ip: [timestamp1, timestamp2, ...]}
+MAX_LOGIN_ATTEMPTS = 5  # Max attempts
+LOGIN_WINDOW = 300  # 5 minutes in seconds
+LOGIN_LOCKOUT = 900  # 15 minutes lockout
+
+# Security logging
+SECURITY_LOG_FILE = os.path.join(BASE_DIR, "nas_security.log")
+
+# Generate secret key for CSRF tokens
+SECRET_KEY = secrets.token_hex(32)
 
 # Protect the running script and any filename you want hidden
 SCRIPT_NAME = os.path.basename(__file__)
 PROTECTED_FILES = {SCRIPT_NAME, "simple_nas.py"}  # add other filenames if needed
 PROTECTED_PATHS = { os.path.abspath(os.path.join(DIRECTORY, n)) for n in PROTECTED_FILES }
+
+# Hide files in the NAS container from web users
+HIDE_DOTFILES = True
+HIDDEN_FILES = {".gitkeep", "desktop.ini", "Thumbs.db"}
+HIDDEN_EXTENSIONS = {".lnk"}
 
 # Try to set Windows "hidden" attribute for protected files (best-effort)
 try:
@@ -43,31 +114,426 @@ except Exception:
 # Store pending delete requests with tokens
 pending_deletes = {}
 
+# SSE clients list and lock for notifying browser clients of filesystem changes
+sse_clients = []
+sse_lock = threading.Lock()
+
+# Security helper functions
+def log_security_event(event_type, details, ip="unknown"):
+    """Log security events to file and console."""
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    log_line = f"[{timestamp}] [{event_type}] IP:{ip} - {details}\n"
+    safe_print(f"[SECURITY] {log_line.strip()}")
+    try:
+        with open(SECURITY_LOG_FILE, "a", encoding="utf-8") as f:
+            f.write(log_line)
+    except Exception as e:
+        try:
+            print(f"Warning: Could not write to security log: {e}")
+        except UnicodeEncodeError:
+            print(f"Warning: Could not write to security log")
+
+def generate_csrf_token():
+    """Generate a secure CSRF token."""
+    return secrets.token_urlsafe(32)
+
+def verify_csrf_token(session_token, csrf_token):
+    """Verify CSRF token matches the session."""
+    return CSRF_TOKENS.get(session_token) == csrf_token
+
+def is_hidden_name(name):
+    """Return True if a filename should be hidden from web users."""
+    base = os.path.basename(name)
+    if base in PROTECTED_FILES:
+        return True
+    if HIDE_DOTFILES and base.startswith('.'):
+        return True
+    if base in HIDDEN_FILES:
+        return True
+    _, ext = os.path.splitext(base)
+    if ext.lower() in HIDDEN_EXTENSIONS:
+        return True
+    return False
+
+def hash_password(password):
+    """Hash password using SHA-256."""
+    return hashlib.sha256(password.encode()).hexdigest()
+
+def check_rate_limit(ip):
+    """Check if IP is rate limited for login attempts."""
+    now = time.time()
+    attempts = LOGIN_ATTEMPTS[ip]
+    
+    # Remove old attempts outside the window
+    LOGIN_ATTEMPTS[ip] = [t for t in attempts if now - t < LOGIN_WINDOW]
+    
+    # Check if locked out
+    if len(LOGIN_ATTEMPTS[ip]) >= MAX_LOGIN_ATTEMPTS:
+        oldest_attempt = min(LOGIN_ATTEMPTS[ip])
+        if now - oldest_attempt < LOGIN_LOCKOUT:
+            return False, LOGIN_LOCKOUT - int(now - oldest_attempt)
+    
+    return True, 0
+
+def record_login_attempt(ip):
+    """Record a failed login attempt."""
+    LOGIN_ATTEMPTS[ip].append(time.time())
+
+def generate_self_signed_cert(cert_file, key_file):
+    """Generate a self-signed SSL certificate if it doesn't exist."""
+    if os.path.exists(cert_file) and os.path.exists(key_file):
+        return True
+    
+    try:
+        from OpenSSL import crypto
+        
+        # Create a key pair
+        k = crypto.PKey()
+        k.generate_key(crypto.TYPE_RSA, 2048)
+        
+        # Create a self-signed cert
+        cert = crypto.X509()
+        cert.get_subject().C = "US"
+        cert.get_subject().ST = "State"
+        cert.get_subject().L = "City"
+        cert.get_subject().O = "NAS Server"
+        cert.get_subject().OU = "NAS"
+        cert.get_subject().CN = CERT_COMMON_NAME
+        cert.set_serial_number(secrets.randbits(64))
+        cert.gmtime_adj_notBefore(0)
+        cert.gmtime_adj_notAfter(365*24*60*60)  # Valid for 1 year
+        cert.set_issuer(cert.get_subject())
+        cert.set_pubkey(k)
+        # Add SANs (Subject Alternative Names)
+        if CERT_SANS:
+            san_value = ", ".join(CERT_SANS)
+            cert.add_extensions([
+                crypto.X509Extension(b"subjectAltName", False, san_value.encode("utf-8"))
+            ])
+        cert.sign(k, 'sha256')
+        
+        # Save certificate and key
+        with open(cert_file, "wb") as f:
+            f.write(crypto.dump_certificate(crypto.FILETYPE_PEM, cert))
+        with open(key_file, "wb") as f:
+            f.write(crypto.dump_privatekey(crypto.FILETYPE_PEM, k))
+        
+        safe_print(f"✓ Generated self-signed certificate: {cert_file}")
+        return True
+    except ImportError:
+        safe_print("⚠️  PyOpenSSL not installed. Generating certificate using openssl command...")
+        try:
+            import subprocess
+            san_value = ",".join(CERT_SANS)
+            subprocess.run([
+                "openssl", "req", "-x509", "-newkey", "rsa:2048",
+                "-keyout", key_file, "-out", cert_file,
+                "-days", "365", "-nodes",
+                "-subj", f"/C=US/ST=State/L=City/O=NAS/CN={CERT_COMMON_NAME}",
+                "-addext", f"subjectAltName={san_value}"
+            ], check=True, capture_output=True)
+            safe_print(f"✓ Generated self-signed certificate: {cert_file}")
+            return True
+        except Exception as e:
+            safe_print(f"❌ Could not generate certificate: {e}")
+            safe_print("   Install PyOpenSSL: pip install pyopenssl")
+            safe_print("   Or install OpenSSL command-line tool")
+            return False
+    except Exception as e:
+        safe_print(f"❌ Error generating certificate: {e}")
+        return False
+
 class CustomRequestHandler(http.server.SimpleHTTPRequestHandler):
-    """Custom request handler to add upload capabilities."""
+    """Custom request handler to add upload capabilities with security."""
+    
+    def handle_one_request(self):
+        """Override to suppress harmless connection errors."""
+        try:
+            super().handle_one_request()
+        except (ConnectionAbortedError, ConnectionResetError, BrokenPipeError):
+            # Client closed connection or socket error — very common and harmless
+            pass
+        except Exception as e:
+            # Log other exceptions normally
+            print(f"[WARN] Request handler error: {type(e).__name__}: {e}")
+    
+    def end_headers(self):
+        """Add security headers to all responses."""
+        # Security headers
+        self.send_header('X-Content-Type-Options', 'nosniff')
+        self.send_header('X-Frame-Options', 'DENY')
+        self.send_header('X-XSS-Protection', '1; mode=block')
+        self.send_header('Referrer-Policy', 'strict-origin-when-cross-origin')
+        self.send_header('Content-Security-Policy', 
+                        "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src 'self' https://fonts.gstatic.com; img-src 'self' data: blob:; connect-src 'self'")
+        if USE_HTTPS:
+            self.send_header('Strict-Transport-Security', 'max-age=31536000; includeSubDomains')
+        super().end_headers()
+    
+    def _get_auth_status(self):
+        """Check if client is authenticated (returns True if auth disabled or client has valid token)."""
+        if not NAS_PASSWORD:
+            return True, None  # No password protection
+        
+        # Check for session token
+        token = None
+        if 'Cookie' in self.headers:
+            import http.cookies
+            cookie = http.cookies.SimpleCookie()
+            cookie.load(self.headers['Cookie'])
+            if 'nas_token' in cookie:
+                token = cookie['nas_token'].value
+        
+        if token and token in SESSION_TOKENS:
+            exp_time = SESSION_TOKENS[token]
+            if time.time() < exp_time:
+                return True, token  # Valid token
+            else:
+                del SESSION_TOKENS[token]  # Expired
+                if token in CSRF_TOKENS:
+                    del CSRF_TOKENS[token]
+        
+        return False, None
+    
+    def _serve_login_page(self):
+        """Serve password login page."""
+        html_content = '''<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>NAS Login</title>
+    <style>
+        * { box-sizing: border-box; margin: 0; padding: 0; }
+        body {
+            font-family: 'Inter', system-ui, -apple-system, sans-serif;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            min-height: 100vh;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            padding: 20px;
+        }
+        .login-container {
+            background: white;
+            border-radius: 12px;
+            box-shadow: 0 10px 40px rgba(0,0,0,0.2);
+            padding: 40px;
+            width: 100%;
+            max-width: 400px;
+        }
+        .login-header {
+            text-align: center;
+            margin-bottom: 32px;
+        }
+        .login-header h1 {
+            font-size: 1.8rem;
+            color: #333;
+            margin-bottom: 4px;
+        }
+        .login-header p {
+            color: #888;
+            font-size: 0.9rem;
+        }
+        .form-group {
+            margin-bottom: 20px;
+        }
+        label {
+            display: block;
+            margin-bottom: 8px;
+            color: #333;
+            font-weight: 500;
+        }
+        input[type="password"] {
+            width: 100%;
+            padding: 12px;
+            border: 1px solid #ddd;
+            border-radius: 6px;
+            font-size: 1rem;
+            transition: border-color 0.2s;
+        }
+        input[type="password"]:focus {
+            outline: none;
+            border-color: #667eea;
+        }
+        button {
+            width: 100%;
+            padding: 12px;
+            background: #667eea;
+            color: white;
+            border: none;
+            border-radius: 6px;
+            font-weight: 600;
+            font-size: 1rem;
+            cursor: pointer;
+            transition: background 0.2s;
+        }
+        button:hover { background: #5568d3; }
+        button:active { transform: scale(0.98); }
+        #errorMsg {
+            margin-top: 16px;
+            padding: 12px;
+            background: #fee;
+            color: #c33;
+            border-radius: 6px;
+            display: none;
+            text-align: center;
+            font-size: 0.9rem;
+        }
+    </style>
+</head>
+<body>
+    <div class="login-container">
+        <div class="login-header">
+            <h1>🔐 NAS Access</h1>
+            <p>Enter password to continue</p>
+        </div>
+        <form id="loginForm" onsubmit="handleLogin(event)">
+            <div class="form-group">
+                <label for="password">Password</label>
+                <input type="password" id="password" name="password" placeholder="Enter password" autofocus required>
+            </div>
+            <button type="submit">Login</button>
+        </form>
+        <div id="errorMsg"></div>
+    </div>
+    <script>
+        function handleLogin(event) {
+            event.preventDefault();
+            var password = document.getElementById('password').value;
+            var errorMsg = document.getElementById('errorMsg');
+            var btn = event.target.querySelector('button');
+            btn.disabled = true;
+            btn.textContent = 'Checking...';
+            
+            fetch('/login', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ password: password })
+            })
+            .then(r => r.json())
+            .then(data => {
+                if (data.token && data.csrf_token) {
+                    // Store CSRF token in sessionStorage
+                    sessionStorage.setItem('csrf_token', data.csrf_token);
+                    errorMsg.style.display = 'none';
+                    window.location.reload();
+                } else {
+                    errorMsg.textContent = data.error || 'Invalid password';
+                    errorMsg.style.display = 'block';
+                    btn.disabled = false;
+                    btn.textContent = 'Login';
+                    document.getElementById('password').value = '';
+                }
+            })
+            .catch(err => {
+                errorMsg.textContent = 'Connection error';
+                errorMsg.style.display = 'block';
+                btn.disabled = false;
+                btn.textContent = 'Login';
+            });
+        }
+    </script>
+</body>
+</html>'''
+        html_bytes = html_content.encode('utf-8')
+        self.send_response(200)
+        self.send_header('Content-Type', 'text/html; charset=utf-8')
+        self.send_header('Content-Length', str(len(html_bytes)))
+        self.end_headers()
+        self.wfile.write(html_bytes)
     
     def do_POST(self):
         """Handle file uploads and delete requests."""
         parsed = urllib.parse.urlparse(self.path)
         
-        if parsed.path == '/delete':
-            # Handle delete request
+        # Handle login
+        if parsed.path == '/login':
             content_length = int(self.headers.get('content-length', 0))
             body = self.rfile.read(content_length)
             try:
                 data = json.loads(body.decode('utf-8'))
-                filename = data.get('file', '')
-                action = data.get('action', '')
+                password = data.get('password', '')
             except:
                 self.send_json_response(400, {'error': 'Invalid JSON'})
                 return
             
+            client_ip = self.client_address[0]
+            
+            # Check rate limiting
+            allowed, lockout_time = check_rate_limit(client_ip)
+            if not allowed:
+                log_security_event("LOGIN_RATE_LIMIT", f"Too many attempts, locked out for {lockout_time}s", client_ip)
+                self.send_json_response(429, {'error': f'Too many attempts. Try again in {lockout_time} seconds'})
+                return
+            
+            # Verify password (compare hashed values)
+            password_hash = hash_password(password)
+            if password_hash == NAS_PASSWORD_HASH:
+                # Generate session token and CSRF token
+                token = secrets.token_urlsafe(32)
+                csrf_token = generate_csrf_token()
+                SESSION_TOKENS[token] = time.time() + SESSION_TIMEOUT
+                CSRF_TOKENS[token] = csrf_token
+                
+                log_security_event("LOGIN_SUCCESS", "User authenticated successfully", client_ip)
+                
+                self.send_response(200)
+                self.send_header('Content-Type', 'application/json')
+                # Secure cookie flags
+                secure_flag = '; Secure' if USE_HTTPS else ''
+                self.send_header('Set-Cookie', f'nas_token={token}; Path=/; HttpOnly; SameSite=Strict{secure_flag}')
+                response = json.dumps({'token': token, 'csrf_token': csrf_token}).encode('utf-8')
+                self.send_header('Content-Length', str(len(response)))
+                self.end_headers()
+                self.wfile.write(response)
+            else:
+                record_login_attempt(client_ip)
+                log_security_event("LOGIN_FAILED", "Invalid password attempt", client_ip)
+                self.send_json_response(403, {'error': 'Invalid password'})
+            return
+        
+        # Check authentication for other POST operations
+        is_auth, session_token = self._get_auth_status()
+        if NAS_PASSWORD and not is_auth:
+            self.send_json_response(401, {'error': 'Unauthorized'})
+            return
+
+        # Extract CSRF token (prefer header to avoid parsing multipart uploads)
+        csrf_token = self.headers.get('X-CSRF-Token', '')
+        data = None
+
+        if parsed.path == '/delete':
+            # Handle delete request (parse JSON once)
+            content_length = int(self.headers.get('content-length', 0))
+            body = self.rfile.read(content_length)
+            try:
+                data = json.loads(body.decode('utf-8'))
+            except Exception:
+                self.send_json_response(400, {'error': 'Invalid JSON'})
+                return
+            if not csrf_token:
+                csrf_token = data.get('csrf_token', '')
+
+        # Verify CSRF token for state-changing operations
+        if NAS_PASSWORD and parsed.path != '/login':
+            if not verify_csrf_token(session_token, csrf_token):
+                log_security_event("CSRF_VIOLATION", f"Invalid CSRF token for {parsed.path}", self.client_address[0])
+                self.send_json_response(403, {'error': 'CSRF token validation failed'})
+                return
+
+        if parsed.path == '/delete':
+            filename = data.get('file', '')
+            action = data.get('action', '')
+            
             if action == 'request':
                 # User requested to delete a file
+                log_security_event("DELETE_REQUEST", f"File: {filename}", self.client_address[0])
                 self._handle_delete_request(filename)
             elif action == 'confirm':
                 # Server admin confirmed the delete
                 token = data.get('token', '')
+                log_security_event("DELETE_CONFIRM", f"File: {filename}, Token: {token}", self.client_address[0])
                 self._handle_delete_confirm(filename, token)
             else:
                 self.send_json_response(400, {'error': 'Invalid action'})
@@ -84,8 +550,8 @@ class CustomRequestHandler(http.server.SimpleHTTPRequestHandler):
         """Generate a delete token and ask admin for confirmation."""
         safe_name = os.path.basename(filename)
 
-        # Protect files — immediate deny
-        if safe_name in PROTECTED_FILES:
+        # Protect/hidden files — immediate deny
+        if is_hidden_name(safe_name):
             self.send_json_response(403, {'error': 'File is protected'})
             return
 
@@ -166,7 +632,87 @@ class CustomRequestHandler(http.server.SimpleHTTPRequestHandler):
 
     def do_GET(self):
         """Handle download requests at /download?file=<name>, otherwise fall back."""
+        # Check authentication for protected paths
+        is_auth, session_token = self._get_auth_status()
+        if NAS_PASSWORD and not is_auth:
+            # Show login page
+            if self.path == '/' or self.path.startswith('/?'):
+                return self._serve_login_page()
+            # Redirect other requests to login
+            self.send_response(302)
+            self.send_header('Location', '/')
+            self.end_headers()
+            return
+        
+        # Pass CSRF token to authenticated users
+        self.csrf_token = CSRF_TOKENS.get(session_token, '') if session_token else ''
+        
         parsed = urllib.parse.urlparse(self.path)
+        # Server-Sent Events endpoint for live-reload
+        if parsed.path == '/events':
+            self.send_response(200)
+            self.send_header('Content-Type', 'text/event-stream')
+            self.send_header('Cache-Control', 'no-cache')
+            self.send_header('Connection', 'keep-alive')
+            self.end_headers()
+
+            client = {'wfile': self.wfile, 'event': threading.Event()}
+            with sse_lock:
+                sse_clients.append(client)
+
+            try:
+                # Keep the connection open and write events when signaled
+                while True:
+                    client['event'].wait()
+                    try:
+                        client['wfile'].write(b"event: reload\ndata: 1\n\n")
+                        client['wfile'].flush()
+                    except Exception:
+                        break
+                    client['event'].clear()
+            finally:
+                with sse_lock:
+                    if client in sse_clients:
+                        sse_clients.remove(client)
+            return
+        
+        # File preview endpoint
+        if parsed.path == '/preview':
+            qs = urllib.parse.parse_qs(parsed.query)
+            if 'file' not in qs or not qs['file']:
+                self.send_error(400, "Missing 'file' parameter")
+                return
+            fname = qs['file'][0]
+            safe_name = os.path.basename(fname)
+            
+            if is_hidden_name(safe_name):
+                self.send_error(404, "File not found")
+                return
+            
+            file_path = os.path.join(DIRECTORY, safe_name)
+            if not os.path.isfile(file_path):
+                self.send_error(404, "File not found")
+                return
+            
+            # Try to serve image preview for image files
+            import mimetypes
+            ctype, _ = mimetypes.guess_type(file_path)
+            if ctype and ctype.startswith('image/'):
+                try:
+                    fs = os.path.getsize(file_path)
+                    self.send_response(200)
+                    self.send_header("Content-Type", ctype)
+                    self.send_header("Content-Length", str(fs))
+                    self.send_header("Cache-Control", "public, max-age=3600")
+                    self.end_headers()
+                    with open(file_path, 'rb') as f:
+                        shutil.copyfileobj(f, self.wfile)
+                except Exception as e:
+                    self.send_error(500, f"Error serving preview: {e}")
+            else:
+                self.send_error(400, "Not an image file")
+            return
+        
         if parsed.path == '/download':
             qs = urllib.parse.parse_qs(parsed.query)
             if 'file' not in qs or not qs['file']:
@@ -177,7 +723,7 @@ class CustomRequestHandler(http.server.SimpleHTTPRequestHandler):
             safe_name = os.path.basename(fname)
 
             # Protect files from download
-            if safe_name in PROTECTED_FILES:
+            if is_hidden_name(safe_name):
                 self.send_error(404, "File not found")
                 return
 
@@ -237,8 +783,8 @@ class CustomRequestHandler(http.server.SimpleHTTPRequestHandler):
                 if item.filename:
                     fn = os.path.basename(item.filename)
 
-                    # Prevent uploads overwriting protected files
-                    if fn in PROTECTED_FILES:
+                    # Prevent uploads overwriting protected/hidden files
+                    if is_hidden_name(fn):
                         return (False, "Cannot overwrite protected file: %s" % fn)
 
                     dest_path = os.path.join(DIRECTORY, fn)
@@ -559,6 +1105,16 @@ body {
 .file-size { font-size: 0.8rem; color: var(--text-muted); margin-top: 2px; }
 .file-actions { display: flex; gap: 8px; flex-shrink: 0; }
 
+/* ── Image thumbnails ── */
+.file-thumbnail {
+  width: 56px;
+  height: 56px;
+  border-radius: var(--radius-sm);
+  object-fit: cover;
+  border: 1px solid var(--border);
+  flex-shrink: 0;
+}
+
 /* ── Toast Notifications ── */
 .toast-container {
   position: fixed;
@@ -596,6 +1152,11 @@ body {
   color: var(--text-muted);
 }
 .empty-state-icon { font-size: 2.5rem; margin-bottom: 12px; display: block; }
+
+/* ── Contacts ── */
+.contact-links { display: flex; flex-wrap: wrap; gap: 12px 18px; }
+.contact-links a { color: var(--primary); text-decoration: none; font-weight: 500; }
+.contact-links a:hover { text-decoration: underline; }
 
 /* ── Mobile-first responsive ── */
 @media (max-width: 640px) {
@@ -655,7 +1216,7 @@ body {
         file_count = 0
         r.append('<ul class="file-list">')
         for name in list:
-            if name in PROTECTED_FILES:
+            if is_hidden_name(name):
                 continue
             fullname = os.path.join(path, name)
             displayname = linkname = name
@@ -677,8 +1238,20 @@ body {
                 if os.path.islink(fullname):
                     displayname = name + "@"
                 dl_url = "/download?file=" + urllib.parse.quote(linkname)
+                
+                # Check if it's an image file for thumbnail preview
+                import mimetypes
+                ctype, _ = mimetypes.guess_type(fullname)
+                is_image = ctype and ctype.startswith('image/')
+                
                 r.append('<li class="file-item">')
-                r.append('<span class="file-icon">📄</span>')
+                if is_image:
+                    # Show image thumbnail
+                    thumb_url = "/preview?file=" + urllib.parse.quote(linkname)
+                    r.append('<img src="%s" class="file-thumbnail" alt="%s">' % (thumb_url, html.escape(name)))
+                else:
+                    # Show file icon
+                    r.append('<span class="file-icon">📄</span>')
                 r.append('<div class="file-info"><div class="file-name">%s</div><div class="file-size">%s</div></div>' % (html.escape(displayname), fsize_str))
                 r.append('<div class="file-actions">')
                 r.append('<a href="%s" class="btn btn-download">⬇ Download</a>' % dl_url)
@@ -697,8 +1270,16 @@ body {
 
         # JavaScript
         r.append('<script>')
+        # Inject CSRF token into JavaScript
+        if hasattr(self, 'csrf_token') and self.csrf_token:
+            r.append(f'var CSRF_TOKEN = "{self.csrf_token}";')
+            r.append('sessionStorage.setItem("csrf_token", CSRF_TOKEN);')
+        else:
+            r.append('var CSRF_TOKEN = sessionStorage.getItem("csrf_token") || "";')
         r.append('''
-/* ── Toast helper ── */
+    var suppressReloadUntil = 0;
+
+    /* ── Toast helper ── */
 function showToast(message, type) {
     type = type || 'info';
     var container = document.getElementById('toastContainer');
@@ -802,12 +1383,16 @@ function uploadFiles(files) {
         uploadStatus.textContent = 'Upload error!';
     });
     xhr.open('POST', '/', true);
+    xhr.setRequestHeader('X-CSRF-Token', CSRF_TOKEN);
     xhr.send(formData);
 }
 
 /* ── Delete ── */
 function deleteFile(filename) {
     if (!confirm('Delete "' + filename + '"?')) return;
+
+    // Avoid auto-reload immediately after delete
+    suppressReloadUntil = Date.now() + 4000;
 
     var progressContainer = document.getElementById('progressContainer');
     var progressFill = document.getElementById('progressFill');
@@ -820,8 +1405,11 @@ function deleteFile(filename) {
 
     fetch('/delete', {
         method: 'POST',
-        headers: {'Content-Type': 'application/json'},
-        body: JSON.stringify({file: filename, action: 'request'})
+        headers: {
+            'Content-Type': 'application/json',
+            'X-CSRF-Token': CSRF_TOKEN
+        },
+        body: JSON.stringify({file: filename, action: 'request', csrf_token: CSRF_TOKEN})
     })
     .then(function(r) { return r.json(); })
     .then(function(data) {
@@ -907,7 +1495,31 @@ document.addEventListener('click', function(e) {
         });
 });
         ''')
+        # Add SSE-based live-reload listener
+        r.append('''
+    // Live-reload via Server-Sent Events
+    if (window.EventSource) {
+            var __es = new EventSource('/events');
+            __es.addEventListener('reload', function(e) {
+                if (Date.now() < suppressReloadUntil) return;
+                try { window.location.reload(); } catch (e) {}
+            });
+      __es.onopen = function() { console.log('SSE connected'); };
+      __es.onerror = function() { /* reconnect handled by browser */ console.log('SSE error'); };
+    }
+        ''')
         r.append('</script>')
+
+        # Contacts section
+        r.append('<div class="card">')
+        r.append('<div class="card-title">📬 Contacts</div>')
+        r.append('<div class="contact-links" style="display:flex;flex-wrap:wrap;gap:12px; font-size:0.9rem; justify-content:center; align-items:center;">')
+        r.append('<a href="mailto:yash5108@gmail.com">Mail</a>')
+        r.append('<a href="https://www.linkedin.com/in/yash-jain-540a9a271/" target="_blank" rel="noopener">LinkedIn</a>')
+        r.append('<a href="https://github.com/Yash5108" target="_blank" rel="noopener">GitHub</a>')
+        r.append('<a href="https://github.com/Yash5108/Python-Based-Local-NAS.git" target="_blank" rel="noopener">Project Repository</a>')
+        r.append('</div>')
+        r.append('</div>')
 
         r.append('</div>')  # end container
         r.append('</body></html>')
@@ -931,9 +1543,58 @@ document.addEventListener('click', function(e) {
 # --- Server Startup ---
 if __name__ == '__main__':
     handler = CustomRequestHandler
+    
+    # Create nas container directory if it doesn't exist
+    if not os.path.exists(DIRECTORY):
+        os.makedirs(DIRECTORY)
+        safe_print(f"✓ Created NAS container directory: {DIRECTORY}")
+    
     # ensure serving directory
     os.chdir(DIRECTORY)
     import socket
+
+    # Helper to snapshot directory state (names, mtimes, sizes)
+    def _dir_snapshot(root):
+        snap = {}
+        try:
+            for name in os.listdir(root):
+                if name in PROTECTED_FILES:
+                    continue
+                p = os.path.join(root, name)
+                try:
+                    stat = os.stat(p)
+                    snap[name] = (stat.st_mtime, stat.st_size)
+                except Exception:
+                    snap[name] = None
+        except Exception:
+            pass
+        return snap
+
+    # Background watcher thread: polls for changes and notifies SSE clients
+    def _watcher_thread():
+        prev = _dir_snapshot(DIRECTORY)
+        while True:
+            try:
+                time.sleep(1)
+                curr = _dir_snapshot(DIRECTORY)
+                if curr != prev:
+                    with sse_lock:
+                        for c in list(sse_clients):
+                            try:
+                                c['event'].set()
+                            except Exception:
+                                pass
+                    prev = curr
+            except Exception:
+                # continue running even if watcher hits an error
+                try:
+                    time.sleep(1)
+                except Exception:
+                    pass
+
+    # Start watcher thread
+    watcher = threading.Thread(target=_watcher_thread, daemon=True)
+    watcher.start()
 
     class ThreadingTCPServer(socketserver.ThreadingMixIn, socketserver.TCPServer):
         allow_reuse_address = True
@@ -954,13 +1615,83 @@ if __name__ == '__main__':
 
     try:
         with ThreadingTCPServer((bind_addr, PORT), handler) as httpd:
-            print(f"Serving at {bind_addr}:{PORT} (dir: {DIRECTORY})")
-            print(f"Accessible locally: http://localhost:{PORT}")
-            print(f"Accessible on LAN:   http://{local_ip}:{PORT}")
+            # Wrap with SSL if HTTPS is enabled
+            if USE_HTTPS:
+                if not generate_self_signed_cert(CERT_FILE, KEY_FILE):
+                    safe_print("\n❌ Failed to generate SSL certificate. Falling back to HTTP.")
+                    USE_HTTPS = False
+                    PORT = 8000
+                else:
+                    try:
+                        context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+                        context.load_cert_chain(CERT_FILE, KEY_FILE)
+                        # Security: Use strong ciphers and TLS 1.2+
+                        context.minimum_version = ssl.TLSVersion.TLSv1_2
+                        context.set_ciphers('ECDHE+AESGCM:ECDHE+CHACHA20:DHE+AESGCM:DHE+CHACHA20:!aNULL:!MD5:!DSS')
+                        httpd.socket = context.wrap_socket(httpd.socket, server_side=True)
+                        log_security_event("SERVER_START", "HTTPS server started", "system")
+                    except Exception as e:
+                        safe_print(f"\n❌ SSL Error: {e}")
+                        safe_print("   Falling back to HTTP...")
+                        USE_HTTPS = False
+                        PORT = 8000
+            
+            protocol = "https" if USE_HTTPS else "http"
+            
+            # Print startup summary
+            safe_print("\n" + "="*70)
+            safe_print("🔥 PYTHON NAS SERVER STARTED (SECURE)".center(70))
+            safe_print("="*70)
+            safe_print(f"\n📍 Server Address:  {bind_addr}:{PORT}")
+            safe_print(f"📂 Directory:       {DIRECTORY}")
+            safe_print(f"🔌 Max Threads:     Unlimited (ThreadingTCPServer)")
+            safe_print(f"🔒 Protocol:        {protocol.upper()}")
+            if USE_HTTPS:
+                safe_print(f"📜 Certificate:     {CERT_FILE}")
+                safe_print(f"🔑 Private Key:     {KEY_FILE}")
+            if NAS_PASSWORD:
+                safe_print(f"🔐 Authentication:  ENABLED (password protected)")
+            else:
+                safe_print(f"🔐 Authentication:  Disabled (open access - NOT RECOMMENDED)")
+            safe_print(f"📊 Upload Limit:    {MAX_UPLOAD_SIZE / (1024*1024):.0f} MB" if MAX_UPLOAD_SIZE else "📊 Upload Limit:    Unlimited")
+            safe_print(f"📝 Security Log:    {SECURITY_LOG_FILE}")
+            safe_print("\n🌐 Access URLs:")
+            safe_print(f"   Local:  {protocol}://localhost:{PORT}")
+            safe_print(f"   LAN:    {protocol}://{local_ip}:{PORT}")
+            if USE_HTTPS:
+                safe_print(f"   ⚠️  Self-signed cert: Browsers will show security warning")
+            safe_print(f"   ⚠️  Network access is on 0.0.0.0 — visible on LAN")
+            safe_print("\n🛡️  Security Features:")
+            if USE_HTTPS:
+                safe_print("   ✓ HTTPS/TLS encryption")
+                safe_print("   ✓ TLS 1.2+ with strong ciphers")
+            safe_print("   ✓ Security headers (CSP, HSTS, X-Frame-Options)")
+            safe_print("   ✓ CSRF protection")
+            safe_print("   ✓ Password hashing (SHA-256)")
+            safe_print("   ✓ Rate limiting (5 attempts per 5 min)")
+            safe_print("   ✓ Secure session cookies")
+            safe_print("   ✓ Input validation & upload limits")
+            safe_print("   ✓ Security event logging")
+            safe_print("\n💡 Features:")
+            safe_print("   ✓ Upload files (drag & drop or click)")
+            safe_print("   ✓ Download files with progress")
+            safe_print("   ✓ Delete files (with server confirmation)")
+            safe_print("   ✓ Live-reload (SSE)")
+            safe_print("   ✓ Responsive mobile-friendly UI")
+            if NAS_PASSWORD:
+                safe_print("   ✓ Password protection")
+            safe_print("\n⚠️  Note: Minor connection errors (WinError 10053) are normal.")
+            safe_print("   These happen when browsers close connections rapidly.")
+            safe_print("\n📋 Press Ctrl+C to stop the server")
+            safe_print("="*70 + "\n")
             httpd.serve_forever()
     except KeyboardInterrupt:
-        print("\nServer stopped.")
+        safe_print("\n\n" + "="*70)
+        safe_print("🛑 SERVER STOPPED".center(70))
+        safe_print("="*70 + "\n")
     except Exception as e:
-        print(f"An error occurred: {e}")
+        safe_print(f"\n❌ An error occurred: {e}")
+        import traceback
+        traceback.print_exc()
 
 
