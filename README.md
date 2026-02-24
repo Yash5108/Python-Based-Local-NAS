@@ -1,64 +1,90 @@
-# Python NAS Server
+# Secure Python NAS Server
 
-A tiny file-server / simple NAS written with Python's built-in http.server. It supports drag-and-drop uploads, downloads with progress, delete requests (admin-confirmed), and automatic browser live-reload when files change.
+A production-ready, secure Network Attached Storage (NAS) server built with Python. It provides HTTPS, authentication, CSRF protection, rate limiting, and a modern web interface for uploads and downloads.
 
 ## Features
 
-- Browse files and folders in the serving directory
-- Drag & drop or click-to-browse file uploads (multipart/form-data)
-- Download files with progress
-- Delete requests that require server admin confirmation
-- Live-reload in connected browsers via Server-Sent Events (SSE)
+- HTTPS/TLS encryption (TLS 1.2+)
+- Password authentication (SHA-256 hash)
+- CSRF protection for uploads and deletes
+- Rate limiting for login attempts
+- Secure session cookies (HttpOnly, Secure, SameSite)
+- File uploads with progress UI
+- File downloads with progress UI
+- Optional delete confirmation on server console
+- Live reload via Server-Sent Events (SSE)
+- Hidden/protected files support
 
 ## Requirements
 
-- Python 3.8+
-- No external packages required
+- Python 3.7 or higher
+- PyOpenSSL (optional, for automatic certificate generation)
 
 ## Quick Start
 
-Open PowerShell, change to the project directory and run:
+### 1. Clone the repository
 
-```powershell
-cd "d:\YASH\local nas"
-python simple_nas.py
+```bash
+git clone https://github.com/Yash5108/Python-Based-Local-NAS.git
+cd Python-Based-Local-NAS
 ```
 
-By default the server listens on port 8000. You can open the UI at:
+### 2. Set a strong password
 
-- http://localhost:8000
+Edit `simple_nas.py` and set:
 
-The server prints the LAN address (if available) when it starts.
+```python
+NAS_PASSWORD = "YourStrongPassword123!"
+```
+
+### 3. Install PyOpenSSL (optional)
+
+```bash
+pip install pyopenssl
+```
+
+### 4. Run the server
+
+```bash
+py simple_nas.py
+```
+
+### 5. Open the UI
+
+- Local: https://localhost:8443
+- LAN: https://YOUR_IP:8443
+
+You will see a browser warning for the self-signed certificate. Click Advanced and proceed.
+
+## File Storage
+
+All user files are stored in the `nas container` folder. The parent directory and hidden files are not accessible from the web UI.
 
 ## Configuration
 
-You can change these variables at the top of `simple_nas.py`:
+Edit these values in `simple_nas.py`:
 
-- `PORT` — TCP port the server listens on (default: `8000`)
-- `DIRECTORY` — root directory served (default: current working directory)
-- `MAX_UPLOAD_SIZE` — optional maximum upload size in bytes (default: `None` = unlimited)
-- `PROTECTED_FILES` — set of filenames that cannot be overwritten, downloaded, or deleted
+```python
+PORT = 8443                           # HTTPS port
+USE_HTTPS = True                      # Enable/disable HTTPS
+MAX_UPLOAD_SIZE = 5120 * 1024 * 1024  # 5 GB upload limit
+NAS_PASSWORD = ""                     # Set your password here
+DIRECTORY = "nas container"           # Folder for shared files
+```
 
-## Live-reload behavior
+## Documentation
 
-The server exposes an SSE endpoint at `/events`. Browsers connect automatically and will reload when the server detects changes in the serving directory. The server uses a lightweight polling watcher (checks every 1s) that notifies connected clients.
+- [SETUP_GUIDE.md](SETUP_GUIDE.md)
+- [SECURITY.md](SECURITY.md)
+- [SECURITY_CHANGELOG.md](SECURITY_CHANGELOG.md)
+- [GITHUB_UPLOAD_LIST.md](GITHUB_UPLOAD_LIST.md)
 
-If you prefer a different strategy (inotify, Watchdog, or polling interval change), edit the watcher implementation in `simple_nas.py`.
+## Contacts
 
-## Security notes
+- Gmail: yash5108@gmail.com
+- LinkedIn: https://www.linkedin.com/in/yash-jain-540a9a271/
+- GitHub: https://github.com/Yash5108
 
-- This project is intended for local/trusted networks and simple personal use. It does not implement authentication.
-- Keep `PROTECTED_FILES` populated with any sensitive filenames (for example `simple_nas.py`).
-- Consider running behind a reverse proxy with TLS for exposure to untrusted networks.
+## License
 
-## Troubleshooting
-
-- If browsers don't auto-reload, ensure your browser allows SSE and that no proxy blocks `text/event-stream` responses.
-- If uploads fail, check `MAX_UPLOAD_SIZE` and file permissions in the serving directory.
-
-## Files
-
-- `simple_nas.py` — main server script
-
----
-Created for quick local file sharing with live-reload.
+Add a LICENSE file if you want to publish this publicly.
