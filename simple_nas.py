@@ -67,7 +67,7 @@ CERT_SANS = [
 
 # Optional password protection (leave empty to disable)
 # IMPORTANT: Use a strong password and never commit this to version control!
-NAS_PASSWORD = "#nas@yash*5108"  # Set to a password to enable authentication
+NAS_PASSWORD = ""  # Set to a password to enable authentication
 # Store hashed password (SHA-256) instead of plaintext
 NAS_PASSWORD_HASH = hashlib.sha256(NAS_PASSWORD.encode()).hexdigest() if NAS_PASSWORD else ""
 
@@ -1693,5 +1693,6 @@ if __name__ == '__main__':
         safe_print(f"\n❌ An error occurred: {e}")
         import traceback
         traceback.print_exc()
+
 
 
