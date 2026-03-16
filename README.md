@@ -87,4 +87,13 @@ DIRECTORY = "nas container"           # Folder for shared files
 
 ## License
 
-Add a LICENSE file if you want to publish this publicly.
+his project is licensed under the MIT License.
+
+You are free to use, modify, and distribute this software, provided that proper attribution is given to the original author.
+
+See the LICENSE file for full details.
+
+If you build upon this project, please include credit such as:
+
+Based on Secure Python NAS Server by Yash Jain
+https://github.com/Yash5108/Python-Based-Local-NAS
