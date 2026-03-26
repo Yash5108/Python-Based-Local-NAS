@@ -1,0 +1,47 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <title>WhatsApp Clone</title>
+    <link rel="stylesheet" href="/static/chat.css">
+</head>
+<body>
+    <div class="chat-container">
+        <!-- Sidebar -->
+        <div class="sidebar">
+            <div class="sidebar-header">
+                <h2>Chats</h2>
+            </div>
+            <div class="user-list" id="userList">
+                <!-- Online users rendered here -->
+            </div>
+        </div>
+
+        <!-- Main Chat -->
+        <div class="main-chat">
+            <div class="chat-header">
+                <h3 id="chatTitle">Global Room (<span id="onlineCount">0</span> online)</h3>
+            </div>
+            
+            <div class="chat-messages" id="chatMessages">
+                <!-- Messages appended here -->
+            </div>
+            <div id="typingIndicator" class="typing-indicator" style="display:none;">Someone is typing...</div>
+
+            <!-- Input area -->
+            <div class="chat-input-area">
+                <button id="btnAttach" class="icon-btn">📎</button>
+                <input type="file" id="fileInput" style="display:none;">
+                <input type="text" id="msgInput" placeholder="Type a message..." autocomplete="off">
+                <button id="btnVoice" class="icon-btn">🎤</button>
+                <button id="btnSend" class="icon-btn send-btn">➤</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Scripts -->
+    <script src="https://cdn.socket.io/4.7.2/socket.io.min.js"></script>
+    <script src="/static/chat.js"></script>
+</body>
+</html>
