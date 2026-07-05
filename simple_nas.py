@@ -46,7 +46,7 @@ except Exception:
     cgi = None
     _HAS_CGI = False
 
-PORT = 8443  # HTTPS port (use 443 for production)
+PORT = 8443
 # Base directory (project root)
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 # NAS Container - all shared files stored here (keeps parent directory protected)
@@ -580,9 +580,16 @@ class CustomRequestHandler(http.server.SimpleHTTPRequestHandler):
         # Handle regular file upload
         r, info = self.deal_post_data()
         print(r, info, "by: %s" % self.client_address[0])
-        self.send_response(303)
-        self.send_header("Location", "/")
-        self.end_headers()
+        if r:
+            self.send_json_response(200, {'status': 'ok', 'message': info})
+        else:
+            # IMPORTANT: previously this always returned 303 regardless of
+            # success/failure, so the browser (which follows the redirect and
+            # ends up on a 200 page) could never tell an upload had failed or
+            # been truncated. Report failures honestly with a non-2xx status
+            # and the real reason, so the client can show it and the user can
+            # retry instead of unknowingly keeping a corrupted file.
+            self.send_json_response(400, {'error': info})
 
     def _handle_delete_request(self, filename):
         """Generate a delete token and ask admin for confirmation."""
@@ -822,12 +829,44 @@ class CustomRequestHandler(http.server.SimpleHTTPRequestHandler):
 
         # If cgi.FieldStorage is available, use it; otherwise use a minimal parser
         if _HAS_CGI:
+            # cgi.FieldStorage will happily parse whatever bytes it manages to
+            # read and return normally even if the connection dies partway
+            # through the body (e.g. flaky Wi-Fi, phone locks the screen, the
+            # tab is closed mid-upload). It gives no signal that anything was
+            # missing, so on its own it silently produces truncated files.
+            # Wrap rfile so we can independently confirm the full
+            # Content-Length was actually received.
+            class _CountingReader:
+                def __init__(self, fp):
+                    self._fp = fp
+                    self.bytes_read = 0
+                def read(self, *a, **kw):
+                    data = self._fp.read(*a, **kw)
+                    self.bytes_read += len(data)
+                    return data
+                def readline(self, *a, **kw):
+                    data = self._fp.readline(*a, **kw)
+                    self.bytes_read += len(data)
+                    return data
+
+            counting_fp = _CountingReader(self.rfile)
             form = cgi.FieldStorage(
-                fp=self.rfile,
+                fp=counting_fp,
                 headers=self.headers,
                 environ={'REQUEST_METHOD': 'POST', 'CONTENT_TYPE': content_type},
                 keep_blank_values=True
             )
+
+            if counting_fp.bytes_read < content_length:
+                log_security_event(
+                    "UPLOAD_TRUNCATED",
+                    f"Connection closed early: got {counting_fp.bytes_read}/{content_length} bytes",
+                    self.client_address[0]
+                )
+                return (False, "Upload interrupted: connection closed before all data "
+                                f"arrived ({counting_fp.bytes_read}/{content_length} bytes). "
+                                "No file was saved — please retry.")
+
             if 'file_upload' not in form:
                 return (False, "No file_upload field in form")
 
@@ -1008,6 +1047,33 @@ class CustomRequestHandler(http.server.SimpleHTTPRequestHandler):
                             buf = buf[safe_len:]
                         # Need more data from socket
                         continue
+
+            # ── Integrity check ──────────────────────────────────────────
+            # The loop above breaks out early (via `if not chunk: break`)
+            # whenever self.rfile.read() returns no data before we've
+            # consumed the full Content-Length — i.e. the connection died
+            # mid-upload (dropped Wi-Fi, phone locked/app backgrounded, tab
+            # closed, etc). Previously the code fell straight through to
+            # "finalize any file still open" below, which moved the
+            # partially-written temp file into the NAS folder and reported
+            # success — silently saving a truncated file. Refuse to do that:
+            # if we didn't receive everything the client promised, discard
+            # the partial file and report a real error instead.
+            if bytes_remaining > 0:
+                if current_file:
+                    try:
+                        current_file.close()
+                        os.unlink(tmpname)
+                    except Exception:
+                        pass
+                log_security_event(
+                    "UPLOAD_TRUNCATED",
+                    f"Connection closed early: {content_length - bytes_remaining}/{content_length} bytes received",
+                    self.client_address[0]
+                )
+                return (False, "Upload interrupted: connection closed before all data "
+                                f"arrived ({content_length - bytes_remaining}/{content_length} bytes). "
+                                "No file was saved — please retry.")
 
             # Finalize any file still open
             if current_file:
@@ -1510,13 +1576,23 @@ function uploadFiles(files) {
         }
     });
     xhr.addEventListener('load', function() {
-        if (xhr.status === 303 || xhr.status === 200) {
+        // The server now returns real JSON with a success/failure status
+        // instead of always redirecting with 303 — previously that meant
+        // failed AND truncated uploads still showed "Upload complete!"
+        // here because the browser had already followed the redirect to
+        // a 200 page by the time this ran.
+        var resp = null;
+        try { resp = JSON.parse(xhr.responseText); } catch (e) { /* ignore */ }
+
+        if (xhr.status === 200 && resp && !resp.error) {
             showToast('Upload complete!', 'success');
             uploadStatus.textContent = 'Upload complete! Reloading...';
             setTimeout(function() { window.location.reload(); }, 1200);
         } else {
-            showToast('Upload failed!', 'error');
-            uploadStatus.textContent = 'Upload failed!';
+            var msg = (resp && resp.error) ? resp.error : ('Upload failed (status ' + xhr.status + ')');
+            showToast(msg, 'error');
+            uploadStatus.textContent = msg;
+            progressFill.textContent = '✗';
         }
     });
     xhr.addEventListener('error', function() {
