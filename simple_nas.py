@@ -122,6 +122,7 @@ sse_lock = threading.Lock()
 session_lock = threading.Lock()   # protects SESSION_TOKENS & CSRF_TOKENS
 login_lock = threading.Lock()     # protects LOGIN_ATTEMPTS
 delete_lock = threading.Lock()    # protects pending_deletes
+admin_console_lock = threading.Lock()  # serializes admin input() prompts (stdin has no per-thread isolation)
 
 # Security helper functions
 def log_security_event(event_type, details, ip="unknown"):
@@ -506,7 +507,7 @@ class CustomRequestHandler(http.server.SimpleHTTPRequestHandler):
             
             # Verify password (compare hashed values)
             password_hash = hash_password(password)
-            if password_hash == NAS_PASSWORD_HASH:
+            if hmac.compare_digest(password_hash, NAS_PASSWORD_HASH):
                 # Generate session token and CSRF token
                 token = secrets.token_urlsafe(32)
                 csrf_token = generate_csrf_token()
@@ -619,33 +620,41 @@ class CustomRequestHandler(http.server.SimpleHTTPRequestHandler):
                 'time': time.time()
             }
         
-        # Prompt the server admin
-        print("\n" + "="*60)
-        print(f"DELETE REQUEST from {client_ip}")
-        print(f"File: {safe_name}")
-        print(f"Token: {token}")
-        print(f"Allow deletion? (yes/no): ", end='', flush=True)
-        
-        # Read admin response
-        try:
-            response = input().strip().lower()
-            if response == 'yes':
-                # Auto-confirm
-                self._execute_delete(safe_name, file_path, token)
-                self.send_json_response(200, {'status': 'File deleted', 'token': token})
-                print(f"✓ File '{safe_name}' deleted by admin approval")
+        # Prompt the server admin. This is serialized with admin_console_lock
+        # because stdin is a single shared resource: if two delete requests
+        # arrive close together, two threads calling input() concurrently
+        # would race for the same line of input — one request could get
+        # approved/denied based on an answer meant for the other, or a
+        # thread could hang forever waiting on input that was already
+        # consumed elsewhere. The lock makes concurrent requests queue up
+        # and be handled one at a time instead.
+        with admin_console_lock:
+            print("\n" + "="*60)
+            print(f"DELETE REQUEST from {client_ip}")
+            print(f"File: {safe_name}")
+            print(f"Token: {token}")
+            print(f"Allow deletion? (yes/no): ", end='', flush=True)
+
+            # Read admin response
+            try:
+                response = input().strip().lower()
+                if response == 'yes':
+                    # Auto-confirm
+                    self._execute_delete(safe_name, file_path, token)
+                    self.send_json_response(200, {'status': 'File deleted', 'token': token})
+                    print(f"✓ File '{safe_name}' deleted by admin approval")
+                    with delete_lock:
+                        del pending_deletes[token]
+                else:
+                    self.send_json_response(403, {'error': 'Delete request denied by admin', 'token': token})
+                    print(f"✗ Delete request denied")
+                    with delete_lock:
+                        del pending_deletes[token]
+            except KeyboardInterrupt:
+                self.send_json_response(500, {'error': 'Server interrupted'})
+                print(f"\n✗ Delete request cancelled (server interrupted)")
                 with delete_lock:
                     del pending_deletes[token]
-            else:
-                self.send_json_response(403, {'error': 'Delete request denied by admin', 'token': token})
-                print(f"✗ Delete request denied")
-                with delete_lock:
-                    del pending_deletes[token]
-        except KeyboardInterrupt:
-            self.send_json_response(500, {'error': 'Server interrupted'})
-            print(f"\n✗ Delete request cancelled (server interrupted)")
-            with delete_lock:
-                del pending_deletes[token]
 
     def _handle_delete_confirm(self, filename, token):
         """Handle client-side confirmation (if needed)."""
